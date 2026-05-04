@@ -33,15 +33,14 @@ from transformers import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-IMAGE_DIR  = Path(r"C:\Users\admin\fur\MLOps_Label\data\full dataset\val\images")
-GT_DIR     = Path(r"C:\Users\admin\fur\MLOps_Label\data\full dataset\val\labels_with_name")
-OUT_DIR    = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out")
-RUN_TS     = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_PATH   = OUT_DIR / f"pipeline_log_{RUN_TS}.txt"
+IMAGE_DIR    = Path(r"C:\Users\admin\fur\0424(쓰러짐)")
+GT_DIR       = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out\20260429_153850_쓰러짐_107\labels_with_name")
+PIPELINE_OUT = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out")
+RUN_TS       = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUT_DIR      = PIPELINE_OUT / f"{RUN_TS}_florence"
+LOG_PATH     = OUT_DIR / "pipeline_log.txt"
 
-# VLM sonuçlarını yeniden kullanmak için: mevcut bir vlm_buckets_*.json dosyasının
-# yolunu buraya yaz. None ise VLM sıfırdan çalışır ve yeni dosya kaydeder.
-VLM_CACHE  = OUT_DIR / "vlm_buckets_20260422_165231.json"  # D prompt: hayvan + karanlık cümlesi, thr=0.75
+VLM_CACHE  = PIPELINE_OUT / "vlm_buckets_20260430_142455.json"
 
 CONF            = 0.25
 IOU_MODEL_MERGE = 0.50   # aynı nesneyi iki model de bulduysa yüksek conf kazanır
@@ -87,6 +86,9 @@ VLM_QUESTION_EXPLAIN = (
 # ── Setup ─────────────────────────────────────────────────────────────────────
 (OUT_DIR / "labels").mkdir(parents=True, exist_ok=True)
 (OUT_DIR / "review").mkdir(parents=True, exist_ok=True)
+(OUT_DIR / "run_config.json").write_text(
+    json.dumps({"IMAGE_DIR": str(IMAGE_DIR), "GT_DIR": str(GT_DIR) if GT_DIR else None},
+               ensure_ascii=False), encoding="utf-8")
 LOG = open(LOG_PATH, "w", encoding="utf-8", buffering=1)
 
 def log(line, quiet=False):
@@ -476,7 +478,7 @@ log(f"Log → {LOG_PATH}")
 # ── Review tool otomatik aç ───────────────────────────────────────────────────
 if review_queue:
     import subprocess, sys
-    tool = Path(__file__).parent.parent / "tools" / "review_tool.py"
+    tool = Path(__file__).parent.parent.parent / "review_tool.py"
     log(f"\n{len(review_queue)} REVIEW foto var — review_tool açılıyor...")
     subprocess.Popen([sys.executable, str(tool)])
 else:

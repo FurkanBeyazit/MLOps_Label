@@ -32,13 +32,14 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 # ── Config ────────────────────────────────────────────────────────────────────
 IMAGE_DIR  = Path(r"C:\Users\admin\fur\MLOps_Label\data\full dataset\val\images")
 GT_DIR     = Path(r"C:\Users\admin\fur\MLOps_Label\data\full dataset\val\labels_with_name")
-OUT_DIR    = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out")
-RUN_TS     = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_PATH   = OUT_DIR / f"pipeline_log_{RUN_TS}.txt"
+PIPELINE_OUT = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out")
+RUN_TS       = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUT_DIR      = PIPELINE_OUT / RUN_TS
+LOG_PATH     = OUT_DIR / "pipeline_log.txt"
 
 # VLM sonuçlarını yeniden kullanmak için: mevcut bir vlm_buckets_*.json dosyasının
 # yolunu buraya yaz. None ise VLM sıfırdan çalışır ve yeni dosya kaydeder.
-VLM_CACHE  = OUT_DIR / "vlm_buckets_20260422_165231.json"
+VLM_CACHE  = None  # yeni prompt, sıfırdan çalıştır
 
 CONF            = 0.25
 IOU_MODEL_MERGE = 0.50
@@ -52,7 +53,8 @@ OWN_MODEL     = _M / "falldown/best_04_15.pt"
 YOLO_CLASSES   = {"person", "car", "bus", "truck", "bicycle", "motorcycle", "dog", "cat"}
 CUSTOM_CLASSES = {"boar", "tractor", "tiller", "scooter"}
 
-VLM_THR   = 0.75
+VLM_THR_YES = 0.75   # YES için daha kolay tetikle
+VLM_THR_NO  = 0.75   # NO için daha emin ol, şüphelileri REVIEW'e gönder
 VLM_MAX_PX = None
 
 # Aşama 2 — Qwen grounding
@@ -61,22 +63,20 @@ MAX_PRED_GROUNDING    = 10   # anomali filtresi: bu sayının üstünde bbox gel
 
 # Aşama 1 — VLM soru
 VLM_QUESTION = (
-    "This is a CCTV security camera image. "
-    "Has a person FALLEN DOWN or is LYING on the ground? "
-    "Answer Yes ONLY if someone is clearly horizontal: lying flat, collapsed, or sprawled. "
-    "Answer No if all people are upright — standing, walking, running "
-    "even if they are on concrete, asphalt, or any outdoor surface. "
-    "A dog, cat or other animal lying on the ground is NOT a fallen person. "
-    "If the image is too dark or the shape is unclear, answer No. "
-    "Ignore animals. "
-    "Answer only Yes or No."
+    "You are a specialized CCTV safety monitor. Analyze the person's posture relative to the ground."
+    "Criteria for YES: The person's torso or back is in direct contact with the ground. They are sprawled, collapsed, or lying flat (horizontal)."
+    "Criteria for NO: The person is supporting their weight on their feet. This includes standing, walking, or running."
+    "Ambiguous Cases: If the person is stumbling, crouching low, or severely leaning but NOT yet lying flat, consider the probability carefully."
+    "Exclude: Ignore animals (dogs/cats). If it is too dark to see the body orientation, answer No."
+    "Answer ONLY with 'Yes' or 'No' as the first word."
 )
 
 VLM_QUESTION_EXPLAIN = (
     "This is a CCTV security camera image. "
     "Has a person FALLEN DOWN or is LYING on the ground? "
     "Answer Yes ONLY if someone is clearly horizontal: lying flat, collapsed, or sprawled. "
-    "Answer No if all people are upright — standing, walking, running "
+    "Answer No ONLY if ALL people are clearly upright — standing, walking, or running normally. "
+    "Do NOT answer No if anyone is severely bent forward, crouching, stumbling, or in an abnormal posture. "
     "Ignore animals. "
     "Answer Yes or No, then in one sentence describe the person's posture and location."
 )
@@ -84,6 +84,9 @@ VLM_QUESTION_EXPLAIN = (
 # ── Setup ─────────────────────────────────────────────────────────────────────
 (OUT_DIR / "labels").mkdir(parents=True, exist_ok=True)
 (OUT_DIR / "review").mkdir(parents=True, exist_ok=True)
+(OUT_DIR / "run_config.json").write_text(
+    json.dumps({"IMAGE_DIR": str(IMAGE_DIR), "GT_DIR": str(GT_DIR) if GT_DIR else None},
+               ensure_ascii=False), encoding="utf-8")
 LOG = open(LOG_PATH, "w", encoding="utf-8", buffering=1)
 
 def log(line, quiet=False):
@@ -92,8 +95,12 @@ def log(line, quiet=False):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def read_image(p):
-    arr = np.fromfile(str(p), np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    try:
+        arr = np.fromfile(str(p), np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except (PermissionError, OSError):
+        log(f"  [SKIP] Okunamadı: {p.name}")
+        return None
 
 def resize_for_vlm(img_bgr):
     if VLM_MAX_PX is None:
@@ -170,7 +177,7 @@ log("AŞAMA 1: VLM Tarama (Qwen3VL)")
 log("=" * 60)
 
 if VLM_CACHE and Path(VLM_CACHE).exists():
-    log(f"VLM_CACHE yükleniyor: {VLM_CACHE}")
+    log(f"VLM_CACHE yükleniyor: {VLM_CACHE.name}")
     raw = json.loads(Path(VLM_CACHE).read_text(encoding="utf-8"))
     raw_buckets    = raw.get("buckets", raw)
     buckets        = {k: [Path(p) for p in v] for k, v in raw_buckets.items()}
@@ -204,8 +211,8 @@ else:
 
     def vlm_classify(img_pil):
         py, pn = vlm_logit(img_pil, VLM_QUESTION)
-        if py >= VLM_THR: return "yes",    py, pn, ""
-        if pn >= VLM_THR: return "no",     py, pn, ""
+        if py >= VLM_THR_YES: return "yes",    py, pn, ""
+        if pn >= VLM_THR_NO:  return "no",     py, pn, ""
         return "review", py, pn, vlm_explain(img_pil)
 
     buckets = {"yes": [], "no": [], "review": []}
@@ -229,7 +236,7 @@ else:
 
     log(f"\nVLM sonuç: YES={len(buckets['yes'])}  NO={len(buckets['no'])}  REVIEW={len(buckets['review'])}\n")
 
-    vlm_cache_path = OUT_DIR / f"vlm_buckets_{RUN_TS}.json"
+    vlm_cache_path = PIPELINE_OUT / f"vlm_buckets_{RUN_TS}.json"
     vlm_cache_path.write_text(
         json.dumps({
             "buckets":         {k: [str(p) for p in v] for k, v in buckets.items()},
@@ -243,7 +250,7 @@ else:
 # AŞAMA 2 — Qwen grounding bbox (sadece YES olanlar)
 # ══════════════════════════════════════════════════════════════════════════════
 log("\n" + "=" * 60)
-log("AŞAMA 2: Qwen grounding bbox (AUTO-YES fotolar)")
+log("AŞAMA 2: Qwen grounding bbox (AUTO-YES + REVIEW fotolar)")
 log(f"  Prompt: {QWEN_GROUNDING_PROMPT}")
 log(f"  Anomali filtresi: MAX_PRED={MAX_PRED_GROUNDING}")
 log("=" * 60)
@@ -257,18 +264,19 @@ def qwen_grounding(img_pil):
 
 falldown_boxes = {}  # img_path → [(x1,y1,x2,y2), ...]
 
-for img_path in buckets["yes"]:
+for img_path in buckets["yes"] + buckets["review"]:
     img_bgr = read_image(img_path)
     if img_bgr is None: continue
     img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     boxes   = qwen_grounding(img_pil)
 
+    tag = "REV" if img_path in set(buckets["review"]) else "YES"
     if len(boxes) > MAX_PRED_GROUNDING:
-        log(f"  [ANOMALİ] {img_path.name[:55]}  → {len(boxes)} bbox (>{MAX_PRED_GROUNDING}, atlandı)")
+        log(f"  [{tag}] [ANOMALİ] {img_path.name[:50]}  → {len(boxes)} bbox (>{MAX_PRED_GROUNDING}, atlandı)")
         falldown_boxes[img_path] = []
     else:
         falldown_boxes[img_path] = boxes
-        log(f"  {img_path.name[:55]}  → {len(boxes)} falldown box")
+        log(f"  [{tag}] {img_path.name[:50]}  → {len(boxes)} falldown box")
 
 del vlm, vlm_proc
 gc.collect(); torch.cuda.empty_cache()
@@ -400,10 +408,16 @@ log("\n" + "=" * 60)
 log(f"AŞAMA 5: GT Karşılaştırma (IOU_EVAL={IOU_EVAL})")
 log("=" * 60)
 
+if not GT_DIR:
+    log("GT_DIR = None → GT karşılaştırma atlandı.")
+    GT_DIR_SKIP = True
+else:
+    GT_DIR_SKIP = False
+
 from collections import defaultdict
 class_stats = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
 
-for img_path in image_files:
+for img_path in ([] if GT_DIR_SKIP else image_files):
     img_bgr = read_image(img_path)
     if img_bgr is None: continue
     img_h, img_w = img_bgr.shape[:2]

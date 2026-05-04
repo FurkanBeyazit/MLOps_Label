@@ -17,6 +17,12 @@ Kısayollar (Editor):
   U / Ctrl+Z → son box geri al
   Scroll     → zoom
   Orta tık   → pan
+
+Bbox düzenleme:
+  Sol tık (boş alan) → sürükle = yeni box çiz
+  Sol tık (box)      → seç
+  Sol tık (seçili, köşe/kenar nokta) → sürükle = resize
+  Sol tık (seçili, iç alan) → sürükle = taşı
 """
 import sys, json
 import cv2
@@ -36,12 +42,48 @@ from PyQt5.QtGui import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-REVIEW_DIR      = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out\review")
-IMAGE_DIR       = Path(r"C:\Users\admin\fur\MLOps_Label\data\full dataset\val\images")
-PIPELINE_LABELS = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out\labels")
-GT_DIR          = Path(r"C:\Users\admin\fur\MLOps_Label\data\full dataset\val\labels_with_name")
-OUT_DIR         = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out\reviewed_labels")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_DIR    = None  # run_config.json'dan okunur; yoksa hata vermesin diye None
+GT_DIR       = None  # run_config.json'dan okunur; pipeline GT_DIR=None ise gösterilmez
+PIPELINE_OUT = Path(r"C:\Users\admin\fur\MLOps_Label\pipeline\pipeline_out")
+
+def _latest_run_dir():
+    import re, sys
+    # Komut satırından spesifik run verilebilir: --run 20260430_151636
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg == "--run" and i + 1 < len(sys.argv) - 1:
+            specific = PIPELINE_OUT / sys.argv[i + 2]
+            if specific.exists():
+                return specific
+    runs = sorted([d for d in PIPELINE_OUT.iterdir()
+                   if d.is_dir() and re.match(r'^\d{8}_\d{6}', d.name)], reverse=True)
+    # labels/ klasörü dolu olan en son run'ı seç (henüz bitmemiş run'ları atla)
+    for r in runs:
+        if (r / "labels").exists() and any((r / "labels").glob("*.txt")):
+            return r
+    return runs[0] if runs else PIPELINE_OUT
+
+def _run_image_dir(run_dir: Path) -> Path:
+    cfg = run_dir / "run_config.json"
+    if cfg.exists():
+        try:
+            return Path(json.load(open(cfg, encoding="utf-8"))["IMAGE_DIR"])
+        except Exception:
+            pass
+    return None
+
+def _run_gt_dir(run_dir: Path):
+    cfg = run_dir / "run_config.json"
+    if cfg.exists():
+        try:
+            val = json.load(open(cfg, encoding="utf-8")).get("GT_DIR")
+            return Path(val) if val else None
+        except Exception:
+            pass
+    return None
+
+_run = _latest_run_dir()
+REVIEW_DIR      = _run / "review"
+PIPELINE_LABELS = _run / "labels"
 
 CLASS_NAMES = [
     "person", "car", "falldown", "bus", "truck",
@@ -119,16 +161,20 @@ def cls_color(name):
 
 # ── BoxItem ───────────────────────────────────────────────────────────────────
 class BoxItem(QGraphicsRectItem):
+    HANDLE_SIZE = 5  # scene-coord half-size of each resize handle square
+
     def __init__(self, rect: QRectF, cls_name: str, from_pipeline=False):
         super().__init__(rect)
         self.cls_name      = cls_name
         self.from_pipeline = from_pipeline
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self._is_selected  = False
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
         self._label = QGraphicsTextItem(cls_name, self)
         self._label.setFont(QFont("Arial", 9, QFont.Bold))
         self._apply_style(False)
 
     def _apply_style(self, selected: bool):
+        self._is_selected = selected
         c   = cls_color(self.cls_name)
         pen = QPen(c, 3 if selected else 2)
         if self.from_pipeline and not selected:
@@ -137,6 +183,7 @@ class BoxItem(QGraphicsRectItem):
         self._label.setDefaultTextColor(c)
         r = self.rect()
         self._label.setPos(r.left(), r.top() - 18)
+        self.update()
 
     def set_selected_visual(self, on: bool):
         self._apply_style(on)
@@ -145,7 +192,43 @@ class BoxItem(QGraphicsRectItem):
         self.cls_name      = cls_name
         self.from_pipeline = False
         self._label.setPlainText(cls_name)
-        self._apply_style(False)
+        self._apply_style(self._is_selected)
+
+    def boundingRect(self):
+        s = self.HANDLE_SIZE + 2
+        return self.rect().adjusted(-s, -s, s, s)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self._is_selected:
+            r = self.rect()
+            x1, y1, x2, y2 = r.left(), r.top(), r.right(), r.bottom()
+            cx, cy = (x1+x2)/2, (y1+y2)/2
+            s = self.HANDLE_SIZE
+            painter.setBrush(QColor("#ffffff"))
+            painter.setPen(QPen(QColor("#222222"), 1))
+            for pt in [
+                QPointF(x1, y1), QPointF(cx, y1), QPointF(x2, y1),
+                QPointF(x1, cy),                   QPointF(x2, cy),
+                QPointF(x1, y2), QPointF(cx, y2),  QPointF(x2, y2),
+            ]:
+                painter.drawRect(QRectF(pt.x()-s, pt.y()-s, s*2, s*2))
+
+    def handle_at(self, scene_pos, view_scale):
+        """Returns handle name ('nw','n','ne','w','e','sw','s','se') or None."""
+        r = self.rect()
+        x1, y1, x2, y2 = r.left(), r.top(), r.right(), r.bottom()
+        cx, cy = (x1+x2)/2, (y1+y2)/2
+        tol = max(self.HANDLE_SIZE + 2, 7.0 / max(view_scale, 0.01))
+        handles = {
+            'nw': QPointF(x1, y1), 'n':  QPointF(cx, y1), 'ne': QPointF(x2, y1),
+            'w':  QPointF(x1, cy),                          'e':  QPointF(x2, cy),
+            'sw': QPointF(x1, y2), 's':  QPointF(cx, y2), 'se': QPointF(x2, y2),
+        }
+        for name, pt in handles.items():
+            if abs(scene_pos.x()-pt.x()) <= tol and abs(scene_pos.y()-pt.y()) <= tol:
+                return name
+        return None
 
     def xyxy(self):
         r = self.rect()
@@ -171,24 +254,42 @@ class LabelCanvas(QGraphicsView):
         self.current_class = CLASS_NAMES[0]
         self.boxes = []
         self._selected = None
+
+        # draw mode
         self._drawing    = False
         self._draw_start = None
         self._temp_rect  = None
+
+        # pan mode
         self._pan_last   = None
+
+        # resize mode
+        self._resize_handle    = None
+        self._resize_item      = None
+        self._resize_orig_rect = None
+        self._resize_start     = None
+
+        # move mode
+        self._move_item      = None
+        self._move_orig_rect = None
+        self._move_start     = None
+
         self.img_w = self.img_h = 1
 
     # ── Image ─────────────────────────────────────────────────────────────────
     def load_image(self, img_bgr):
         self._scene.clear()
         self.boxes.clear()
-        self._selected   = None
-        self._temp_rect  = None
-        self.img_h, self.img_w = img_bgr.shape[:2]
-        pix = cv2_to_pixmap(img_bgr)
+        self._selected          = None
+        self._temp_rect         = None
+        self._resize_handle     = None
+        self._resize_item       = None
+        self._move_item         = None
+        self.img_h, self.img_w  = img_bgr.shape[:2]
+        pix  = cv2_to_pixmap(img_bgr)
         item = self._scene.addPixmap(pix)
         item.setZValue(0)
         self._scene.setSceneRect(0, 0, self.img_w, self.img_h)
-        # Layout tamamlandıktan sonra fit et
         QTimer.singleShot(0, lambda: self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio))
 
     # ── Box management ────────────────────────────────────────────────────────
@@ -231,19 +332,74 @@ class LabelCanvas(QGraphicsView):
             out.append((b.cls_name, cx, cy, bw, bh))
         return out
 
+    # ── Resize / move helpers ─────────────────────────────────────────────────
+    def _apply_resize(self, orig: QRectF, handle: str, dx: float, dy: float) -> QRectF:
+        x1, y1, x2, y2 = orig.left(), orig.top(), orig.right(), orig.bottom()
+        if 'w' in handle: x1 = min(x1+dx, x2-5)
+        if 'e' in handle: x2 = max(x2+dx, x1+5)
+        if 'n' in handle: y1 = min(y1+dy, y2-5)
+        if 's' in handle: y2 = max(y2+dy, y1+5)
+        x1 = max(0.0, x1);          y1 = max(0.0, y1)
+        x2 = min(float(self.img_w), x2); y2 = min(float(self.img_h), y2)
+        return QRectF(x1, y1, x2-x1, y2-y1)
+
+    def _clamp_rect(self, rect: QRectF) -> QRectF:
+        x1 = max(0.0, rect.left())
+        y1 = max(0.0, rect.top())
+        x2 = min(float(self.img_w), rect.right())
+        y2 = min(float(self.img_h), rect.bottom())
+        return QRectF(x1, y1, max(5.0, x2-x1), max(5.0, y2-y1))
+
+    def _resize_cursor(self, handle: str):
+        return {
+            'nw': Qt.SizeFDiagCursor, 'se': Qt.SizeFDiagCursor,
+            'ne': Qt.SizeBDiagCursor, 'sw': Qt.SizeBDiagCursor,
+            'n':  Qt.SizeVerCursor,   's':  Qt.SizeVerCursor,
+            'w':  Qt.SizeHorCursor,   'e':  Qt.SizeHorCursor,
+        }.get(handle, Qt.SizeAllCursor)
+
+    def _update_hover_cursor(self, scene_pos: QPointF):
+        if self._selected:
+            scale = self.transform().m11()
+            h = self._selected.handle_at(scene_pos, scale)
+            if h:
+                self.setCursor(self._resize_cursor(h))
+                return
+            if self._selected.rect().contains(scene_pos):
+                self.setCursor(Qt.SizeAllCursor)
+                return
+        self.setCursor(Qt.ArrowCursor)
+
     # ── Mouse ─────────────────────────────────────────────────────────────────
     def mousePressEvent(self, ev):
         if ev.button() == Qt.LeftButton:
             pos  = self.mapToScene(ev.pos())
             item = self._scene.itemAt(pos, self.transform())
-            # Resolve text→parent
             if isinstance(item, QGraphicsTextItem):
                 item = item.parentItem()
+
             if isinstance(item, BoxItem):
-                self._select(item)
-                # Update class dropdown externally via signal
-                self.changed.emit()
+                if item is self._selected:
+                    # Already selected → check resize handle first, then move
+                    scale  = self.transform().m11()
+                    handle = item.handle_at(pos, scale)
+                    if handle:
+                        self._resize_handle    = handle
+                        self._resize_item      = item
+                        self._resize_orig_rect = QRectF(item.rect())
+                        self._resize_start     = pos
+                        self.setCursor(self._resize_cursor(handle))
+                    else:
+                        self._move_item      = item
+                        self._move_orig_rect = QRectF(item.rect())
+                        self._move_start     = pos
+                        self.setCursor(Qt.SizeAllCursor)
+                else:
+                    self._select(item)
+                    self.changed.emit()
                 return
+
+            # Click on empty area → deselect + start draw
             self._select(None)
             self._drawing    = True
             self._draw_start = pos
@@ -261,29 +417,68 @@ class LabelCanvas(QGraphicsView):
             self.remove_selected()
 
     def mouseMoveEvent(self, ev):
-        if self._drawing and self._temp_rect and self._draw_start:
-            r = QRectF(self._draw_start, self.mapToScene(ev.pos())).normalized()
-            self._temp_rect.setRect(r)
+        pos = self.mapToScene(ev.pos())
 
-        elif self._pan_last is not None:
+        if self._resize_handle and self._resize_item:
+            dx = pos.x() - self._resize_start.x()
+            dy = pos.y() - self._resize_start.y()
+            new_rect = self._apply_resize(self._resize_orig_rect, self._resize_handle, dx, dy)
+            self._resize_item.setRect(new_rect)
+            self._resize_item._apply_style(True)
+            self.changed.emit()
+            return
+
+        if self._move_item:
+            dx = pos.x() - self._move_start.x()
+            dy = pos.y() - self._move_start.y()
+            r  = self._move_orig_rect
+            new_rect = self._clamp_rect(QRectF(r.left()+dx, r.top()+dy, r.width(), r.height()))
+            self._move_item.setRect(new_rect)
+            self._move_item._apply_style(True)
+            self.changed.emit()
+            return
+
+        if self._drawing and self._temp_rect and self._draw_start:
+            r = QRectF(self._draw_start, pos).normalized()
+            self._temp_rect.setRect(r)
+            return
+
+        if self._pan_last is not None:
             delta = ev.pos() - self._pan_last
             self._pan_last = ev.pos()
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            return
+
+        self._update_hover_cursor(pos)
 
     def mouseReleaseEvent(self, ev):
-        if ev.button() == Qt.LeftButton and self._drawing:
-            self._drawing = False
-            pos  = self.mapToScene(ev.pos())
-            rect = QRectF(self._draw_start, pos).normalized()
-            if self._temp_rect:
-                self._scene.removeItem(self._temp_rect)
-                self._temp_rect = None
-            if rect.width() > 5 and rect.height() > 5:
-                b = self.add_box(self.current_class,
-                                 rect.left(), rect.top(), rect.right(), rect.bottom())
-                self._select(b)
+        if ev.button() == Qt.LeftButton:
+            if self._resize_handle:
+                self._resize_handle = self._resize_item = None
+                self._resize_orig_rect = self._resize_start = None
+                self.setCursor(Qt.ArrowCursor)
+                return
+
+            if self._move_item:
+                self._move_item._apply_style(True)
+                self._move_item = self._move_orig_rect = self._move_start = None
+                self.setCursor(Qt.ArrowCursor)
                 self.changed.emit()
+                return
+
+            if self._drawing:
+                self._drawing = False
+                pos  = self.mapToScene(ev.pos())
+                rect = QRectF(self._draw_start, pos).normalized()
+                if self._temp_rect:
+                    self._scene.removeItem(self._temp_rect)
+                    self._temp_rect = None
+                if rect.width() > 5 and rect.height() > 5:
+                    b = self.add_box(self.current_class,
+                                     rect.left(), rect.top(), rect.right(), rect.bottom())
+                    self._select(b)
+                    self.changed.emit()
 
         elif ev.button() == Qt.MiddleButton:
             self._pan_last = None
@@ -311,13 +506,22 @@ class LabelEditor(QWidget):
         super().__init__()
         self.image_files = []
         self.cur_idx = 0
-        self._vlm_info = {}   # image_name → {explain, p_yes, p_no}
+        self._vlm_info = {}
+        self._pipeline_labels = PIPELINE_OUT  # fallback; updated in _scan_images
+        self._review_dir      = PIPELINE_OUT
+        self._gt_dir          = None
         self._build_ui()
         self.setStyleSheet(DARK)
         self._scan_images()
 
+    def _out_dir(self) -> Path:
+        """Reviewed labels go to the current run's reviewed_labels subfolder."""
+        d = self._pipeline_labels.parent / "reviewed_labels"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def _load_vlm_explains(self):
-        jsons = sorted(REVIEW_DIR.glob("review_*.json"))
+        jsons = sorted(self._review_dir.glob("review_*.json"))
         for jf in jsons:
             try:
                 for entry in json.load(open(jf, encoding="utf-8")):
@@ -328,14 +532,18 @@ class LabelEditor(QWidget):
                 pass
 
     def _scan_images(self):
-        # En son review_*.json'dan listeyi al — eski run fotoları karışmasın
-        jsons = sorted(REVIEW_DIR.glob("review_*.json"))
+        _run = _latest_run_dir()
+        self._review_dir      = _run / "review"
+        self._pipeline_labels = _run / "labels"
+        self._image_dir       = _run_image_dir(_run)
+        self._gt_dir          = _run_gt_dir(_run)
+        jsons = sorted(self._review_dir.glob("review_*.json"))
         if jsons:
             latest = jsons[-1]
             try:
                 entries = json.load(open(latest, encoding="utf-8"))
                 names   = [e["image"] for e in entries if "image" in e]
-                self.image_files = [IMAGE_DIR / n for n in names if (IMAGE_DIR / n).exists()]
+                self.image_files = [self._image_dir / n for n in names if (self._image_dir / n).exists()]
             except Exception:
                 self.image_files = []
         else:
@@ -420,8 +628,10 @@ class LabelEditor(QWidget):
         rv.addStretch()
         hint = QLabel(
             "<small><b>Kısayollar</b><br>"
-            "Sürükle → yeni box<br>"
+            "Sürükle (boş) → yeni box<br>"
             "Sol tık → seç<br>"
+            "Seçili + köşe/kenar → resize<br>"
+            "Seçili + iç → taşı<br>"
             "Sağ tık / Del → sil<br>"
             "U / Ctrl+Z → geri al<br>"
             "1-9 → class seç<br>"
@@ -450,7 +660,6 @@ class LabelEditor(QWidget):
         n = len(self.canvas.boxes)
         pl = sum(1 for b in self.canvas.boxes if b.from_pipeline)
         self.status.setText(f"Box: {n}  (pipeline: {pl}, kullanıcı: {n-pl})")
-        # Sync class list if a box is selected
         sel = self.canvas._selected
         if sel and sel.cls_name in CLASS_NAMES:
             self.cls_list.blockSignals(True)
@@ -462,17 +671,16 @@ class LabelEditor(QWidget):
         self.cur_idx = idx
         p = self.image_files[idx]
 
-        # Orijinal temiz fotoğrafı yükle (review klasöründekinde box yakılmış olabilir)
-        orig = IMAGE_DIR / p.name
+        orig = self._image_dir / p.name
         img  = read_cv2(orig if orig.exists() else p)
         if img is None: return
 
         self.canvas.load_image(img)
         h, w = img.shape[:2]
 
-        # Önce reviewed label varsa onu yükle, yoksa pipeline label
-        reviewed  = OUT_DIR / (p.stem + ".txt")
-        label_src = reviewed if reviewed.exists() else PIPELINE_LABELS / (p.stem + ".txt")
+        # Load priority: reviewed label → pipeline label
+        reviewed  = self._out_dir() / (p.stem + ".txt")
+        label_src = reviewed if reviewed.exists() else self._pipeline_labels / (p.stem + ".txt")
         is_pipeline = not reviewed.exists()
 
         for cls_name, box in load_labels(label_src):
@@ -484,13 +692,10 @@ class LabelEditor(QWidget):
         self.fname_lbl.setText(name if len(name) <= 32 else "…" + name[-29:])
         self._on_canvas_changed()
 
-        # VLM açıklamasını göster
         info = self._vlm_info.get(p.name, {})
         if info.get("explain"):
             py, pn = info.get("p_yes", 0), info.get("p_no", 0)
-            self.vlm_box.setText(
-                f"P(Yes)={py:.2f}  P(No)={pn:.2f}\n\n{info['explain']}"
-            )
+            self.vlm_box.setText(f"P(Yes)={py:.2f}  P(No)={pn:.2f}\n\n{info['explain']}")
         else:
             self.vlm_box.setText("—")
 
@@ -498,10 +703,10 @@ class LabelEditor(QWidget):
         if not self.image_files: return
         p      = self.image_files[self.cur_idx]
         labels = self.canvas.get_labels()
-        out    = OUT_DIR / (p.stem + ".txt")
+        out    = self._out_dir() / (p.stem + ".txt")
         lines  = [f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}" for cls, cx, cy, bw, bh in labels]
         out.write_text("\n".join(lines), encoding="utf-8")
-        self.status.setText(f"✓ Kaydedildi  ({len(labels)} box)  → {out.name}")
+        self.status.setText(f"✓ Kaydedildi  ({len(labels)} box)  → {out.parent.name}/{out.name}")
 
     def prev_image(self):
         self.save_current()
@@ -536,10 +741,18 @@ class LabelEditor(QWidget):
 class ReviewGallery(QWidget):
     def __init__(self):
         super().__init__()
-        self.image_files = []
-        self._cur_img_path = None
+        self.image_files       = []
+        self._cur_img_path     = None
+        self._pipeline_labels  = PIPELINE_OUT  # fallback; updated in refresh()
+        self._review_dir       = PIPELINE_OUT
+        self._gt_dir           = None
         self._build_ui()
         self.setStyleSheet(DARK)
+
+    def _out_dir(self) -> Path:
+        d = self._pipeline_labels.parent / "reviewed_labels"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _build_ui(self):
         root = QHBoxLayout(self)
@@ -569,12 +782,10 @@ class ReviewGallery(QWidget):
         cv_layout = QVBoxLayout(center)
         cv_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Editable canvas (aynı LabelCanvas)
         self.canvas = LabelCanvas()
         self.canvas.changed.connect(self._on_canvas_changed)
         cv_layout.addWidget(self.canvas, stretch=1)
 
-        # Class seçici (gallery'de de lazım)
         cls_bar = QHBoxLayout()
         cls_bar.addWidget(QLabel("Class:"))
         self.cls_list = QListWidget()
@@ -589,7 +800,6 @@ class ReviewGallery(QWidget):
         self.cls_list.currentRowChanged.connect(self._cls_changed)
         cv_layout.addWidget(self.cls_list)
 
-        # Kaydet butonu
         nav = QHBoxLayout()
         self.btn_save = QPushButton("💾  Kaydet  (S)")
         self.btn_save.setStyleSheet(
@@ -603,7 +813,6 @@ class ReviewGallery(QWidget):
         nav.addWidget(self.lbl_status, stretch=1)
         cv_layout.addLayout(nav)
 
-        # GT stats
         self.stats = QLabel("—")
         self.stats.setStyleSheet(
             "background:#0d1f0d; color:#aaffaa; padding:6px 8px;"
@@ -627,7 +836,9 @@ class ReviewGallery(QWidget):
         rv.addWidget(gt_lbl)
         rv.addStretch()
         hint = QLabel(
-            "<small>Sürükle → yeni box<br>"
+            "<small>Sürükle (boş) → yeni box<br>"
+            "Seçili + köşe/kenar → resize<br>"
+            "Seçili + iç → taşı<br>"
             "Sağ tık / Del → sil<br>"
             "U / Ctrl+Z → geri al<br>"
             "S → kaydet<br>"
@@ -659,22 +870,29 @@ class ReviewGallery(QWidget):
             self.cls_list.blockSignals(False)
 
     def refresh(self):
-        all_files = sorted(list(IMAGE_DIR.glob("*.jpg")) +
-                           list(IMAGE_DIR.glob("*.png")) +
-                           list(IMAGE_DIR.glob("*.jpeg")))
-        has_label = [f for f in all_files if (PIPELINE_LABELS / (f.stem+".txt")).exists()]
+        _run = _latest_run_dir()
+        self._pipeline_labels = _run / "labels"
+        self._review_dir      = _run / "review"
+        self._image_dir       = _run_image_dir(_run)
+        self._gt_dir          = _run_gt_dir(_run)
+
+        all_files = sorted(list(self._image_dir.glob("*.jpg")) +
+                           list(self._image_dir.glob("*.png")) +
+                           list(self._image_dir.glob("*.jpeg")))
+        has_label = [f for f in all_files if (self._pipeline_labels / (f.stem+".txt")).exists()]
         no_label  = [f for f in all_files if f not in set(has_label)]
         self.image_files = has_label + no_label
 
-        review_stems = {f.stem for f in REVIEW_DIR.glob("*.jpg")} | \
-                       {f.stem for f in REVIEW_DIR.glob("*.png")}
+        out_dir      = self._out_dir()
+        review_stems = {f.stem for f in self._review_dir.glob("*.jpg")} | \
+                       {f.stem for f in self._review_dir.glob("*.png")}
 
         self.file_list.clear()
         for f in self.image_files:
-            reviewed  = (OUT_DIR / (f.stem + ".txt")).exists()
+            reviewed  = (out_dir / (f.stem + ".txt")).exists()
             is_review = f.stem in review_stems
             prefix = "✓ " if reviewed else ("⚠ " if is_review else "  ")
-            self.file_list.addItem(prefix + f.name)   # tam isim
+            self.file_list.addItem(prefix + f.name)
 
         if self.image_files:
             self.file_list.setCurrentRow(0)
@@ -687,22 +905,22 @@ class ReviewGallery(QWidget):
         if img is None: return
         h, w = img.shape[:2]
 
-        # Canvas'a temiz fotoğraf yükle
         self.canvas.load_image(img)
 
-        # Pred labels: reviewed > pipeline
-        reviewed  = OUT_DIR / (p.stem + ".txt")
-        src       = reviewed if reviewed.exists() else PIPELINE_LABELS / (p.stem + ".txt")
+        # Load priority: reviewed → pipeline
+        out_dir     = self._out_dir()
+        reviewed    = out_dir / (p.stem + ".txt")
+        src         = reviewed if reviewed.exists() else self._pipeline_labels / (p.stem + ".txt")
         is_pipeline = not reviewed.exists()
         for cls_name, box in load_labels(src):
             x1, y1, x2, y2 = norm_to_xyxy(box, w, h)
             self.canvas.add_box(cls_name, x1, y1, x2, y2, from_pipeline=is_pipeline)
 
-        # GT boxes — canvas üzerine seçilemeyen beyaz dashed item olarak ekle
-        gt_all = load_labels(GT_DIR / (p.stem + ".txt"))
+        # GT boxes — white dashed, non-selectable
+        gt_all = load_labels(self._gt_dir / (p.stem + ".txt")) if self._gt_dir else []
         for cls_name, box in gt_all:
             x1, y1, x2, y2 = norm_to_xyxy(box, w, h)
-            rect = QRectF(x1, y1, x2-x1, y2-y1)
+            rect    = QRectF(x1, y1, x2-x1, y2-y1)
             gt_item = QGraphicsRectItem(rect)
             gt_item.setPen(QPen(QColor("#ffffff"), 1, Qt.DashLine))
             gt_item.setZValue(0.5)
@@ -713,8 +931,7 @@ class ReviewGallery(QWidget):
             lbl.setPos(x1, y2 + 2)
             self.canvas._scene.addItem(gt_item)
 
-        # Stats hesapla
-        preds  = load_labels(src)
+        preds = load_labels(src)
         self._compute_stats(preds, gt_all, w, h)
         self.lbl_status.setText(p.name)
 
@@ -760,18 +977,16 @@ class ReviewGallery(QWidget):
 
     def save_current(self):
         if not self._cur_img_path: return
-        labels = self.canvas.get_labels()
-        # GT item'larını filtrele (bunlar BoxItem değil, sıradan QGraphicsRectItem)
-        out = OUT_DIR / (self._cur_img_path.stem + ".txt")
-        lines = [f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}" for cls, cx, cy, bw, bh in labels]
+        labels  = self.canvas.get_labels()
+        out_dir = self._out_dir()
+        out     = out_dir / (self._cur_img_path.stem + ".txt")
+        lines   = [f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}" for cls, cx, cy, bw, bh in labels]
         out.write_text("\n".join(lines), encoding="utf-8")
         self.lbl_status.setText(f"✓ Kaydedildi  ({len(labels)} box)")
-        # Liste ikonunu güncelle
-        row = self.file_list.currentRow()
+        row  = self.file_list.currentRow()
         item = self.file_list.item(row)
         if item:
-            name = self._cur_img_path.name
-            item.setText("✓ " + name)
+            item.setText("✓ " + self._cur_img_path.name)
 
     def keyPressEvent(self, ev):
         k   = ev.key()
